@@ -94,9 +94,15 @@ async function loadChat(id) {
   chatContainer.scrollTop = chatContainer.scrollHeight;
 }
 
-// Load chat from URL if present
-const urlChat = new URLSearchParams(location.search).get('chat');
-if (urlChat) loadChat(urlChat);
+// Load chat from URL, or resume most recent
+const params = new URLSearchParams(location.search);
+if (params.has('chat')) {
+  loadChat(params.get('chat'));
+} else if (!params.has('new')) {
+  fetch('/chats').then(r => r.json()).then(data => {
+    if (data.chats.length > 0) loadChat(data.chats[0].id);
+  });
+}
 
 async function sendMessage() {
   const text = userInput.value.trim();

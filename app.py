@@ -6,7 +6,7 @@ import os
 import threading
 import uuid
 from datetime import datetime, timezone
-from flask import Flask, request, jsonify, render_template, Response
+from flask import Flask, request, jsonify, render_template, redirect, Response
 import anthropic
 
 app = Flask(__name__)
@@ -51,7 +51,8 @@ Backend API (use via fetch() in run_js):
 - GET /chats/<id> → {"id", "title", "updated_at", "messages": [...]}
 - DELETE /chats/<id> → deletes a chat
 Chats auto-save after each exchange. Title is derived from the first user message. \
-Navigate to a chat with /?chat=<id>. Navigate to / for a new chat. \
+Navigate to a chat with /?chat=<id>. Navigate to /new for a new chat. \
+/picker shows all saved chats. / reopens the most recent chat. \
 The current chat ID is in the JS variable `chatId` (null if new).\
 """
 
@@ -123,6 +124,16 @@ def load_messages(chat_id):
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/new")
+def new_chat_page():
+    return redirect("/?new")
+
+
+@app.route("/picker")
+def picker():
+    return render_template("picker.html")
 
 
 @app.route("/tool_result/<tool_id>", methods=["POST"])

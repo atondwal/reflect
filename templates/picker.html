@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chats</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Times New Roman", Times, serif; max-width: 600px; margin: 0 auto; padding: 24px 16px; }
+  h1 { font-size: 20px; margin-bottom: 16px; }
+  .new-btn { display: inline-block; font-family: "Courier New", monospace; font-size: 14px; padding: 6px 16px; border: 1px solid #999; text-decoration: none; color: #333; margin-bottom: 16px; }
+  .new-btn:hover { background: #f0f0f0; }
+  .chat-list { list-style: none; }
+  .chat-list li { border-bottom: 1px solid #eee; }
+  .chat-list a { display: block; padding: 10px 4px; text-decoration: none; color: #333; }
+  .chat-list a:hover { background: #f8f8f8; }
+  .chat-title { font-size: 15px; }
+  .chat-meta { font-family: "Courier New", monospace; font-size: 11px; color: #999; margin-top: 2px; }
+  .chat-actions { float: right; }
+  .chat-actions button { background: none; border: none; color: #c00; cursor: pointer; font-size: 12px; font-family: "Courier New", monospace; }
+  .chat-actions button:hover { text-decoration: underline; }
+  .empty { color: #999; font-style: italic; padding: 20px 0; }
+</style>
+</head>
+<body>
+<h1>Chats</h1>
+<a href="/new" class="new-btn">+ New chat</a>
+<ul class="chat-list" id="list"></ul>
+<script>
+async function load() {
+  const res = await fetch('/chats');
+  const data = await res.json();
+  const list = document.getElementById('list');
+  if (data.chats.length === 0) {
+    list.innerHTML = '<li class="empty">No chats yet.</li>';
+    return;
+  }
+  list.innerHTML = data.chats.map(c => {
+    const d = c.updated_at ? new Date(c.updated_at).toLocaleString() : '';
+    return `<li>
+      <a href="/?chat=${c.id}">
+        <span class="chat-actions"><button onclick="del('${c.id}',event)">delete</button></span>
+        <div class="chat-title">${esc(c.title)}</div>
+        <div class="chat-meta">${d}</div>
+      </a>
+    </li>`;
+  }).join('');
+}
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+async function del(id, e) {
+  e.preventDefault();
+  e.stopPropagation();
+  await fetch('/chats/' + id, {method: 'DELETE'});
+  load();
+}
+load();
+</script>
+</body>
+</html>
