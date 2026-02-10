@@ -79,6 +79,12 @@ async function loadChat(id) {
           tb.innerHTML = '<div class="tool-header">run_js \u2714</div><pre></pre>';
           tb.querySelector('pre').textContent = block.input.code;
           chatContainer.appendChild(tb);
+          try { eval(block.input.code); } catch(e) {
+            const r = document.createElement('div');
+            r.className = 'tool-result error';
+            r.textContent = '\u2192 Error: ' + e.message;
+            tb.appendChild(r);
+          }
         }
       }
     }
