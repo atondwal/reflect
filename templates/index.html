@@ -41,7 +41,7 @@
   }
   #input-area button:disabled { opacity: 0.5; cursor: default; }
   #loading { display: none; padding: 8px 16px; color: #888; font-style: italic; }
-  .tool-bubble { background: #1a1a2e; color: #0f0; border-radius: 8px; margin-bottom: 12px; max-width: 90%; font-family: monospace; font-size: 13px; overflow: hidden; }
+  .tool-bubble { background: #1a1a2e; color: #e0e0e0; border-radius: 8px; margin-bottom: 12px; max-width: 90%; font-family: monospace; font-size: 13px; overflow: hidden; }
   .tool-bubble .tool-header { background: #16213e; color: #aaa; padding: 6px 12px; font-size: 12px; }
   .tool-bubble pre { margin: 0; padding: 10px 12px; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto; }
   .tool-bubble.executed .tool-header { color: #4caf50; }
@@ -78,7 +78,7 @@ async function sendMessage() {
   let currentBubble = null;
   let currentBubbleText = '';
   let toolBubble = null;
-  let toolCode = '';
+  let toolRawJson = '';
 
   try {
     const res = await fetch('/chat', {
@@ -99,13 +99,17 @@ async function sendMessage() {
       const parts = buffer.split('\n\n');
       buffer = parts.pop();
 
+      // Collect all events from this chunk
+      const events = [];
       for (const part of parts) {
         for (const line of part.split('\n')) {
           const trimmed = line.trim();
           if (!trimmed.startsWith('data: ')) continue;
+          events.push(JSON.parse(trimmed.slice(6)));
+        }
+      }
 
-          const data = JSON.parse(trimmed.slice(6));
-
+      for (const data of events) {
           if (data.type === 'text_start') {
             loading.style.display = 'none';
             currentBubble = document.createElement('div');
@@ -121,25 +125,26 @@ async function sendMessage() {
             }
           } else if (data.type === 'tool_start') {
             loading.style.display = 'none';
-            toolCode = '';
+            toolRawJson = '';
             toolBubble = document.createElement('div');
             toolBubble.className = 'tool-bubble';
             toolBubble.innerHTML = '<div class="tool-header">run_js</div><pre></pre>';
             chatContainer.appendChild(toolBubble);
+            await new Promise(r => requestAnimationFrame(r));
           } else if (data.type === 'tool_delta') {
-            toolCode += data.content;
+            toolRawJson += data.content;
             if (toolBubble) {
-              // strip JSON wrapper to show just the code
-              let display = toolCode;
-              try {
-                const parsed = JSON.parse(toolCode);
-                display = parsed.code || toolCode;
-              } catch(e) {
-                // partial JSON — strip leading {"code":" and trailing
-                display = toolCode.replace(/^\{"code"\s*:\s*"/, '').replace(/"\}$/, '');
+              let display = toolRawJson;
+              const match = display.match(/^\s*\{\s*"code"\s*:\s*"([\s\S]*)$/);
+              if (match) {
+                display = match[1].replace(/"\s*\}\s*$/, '');
+                display = display.replace(/\\n/g, '\n').replace(/\\t/g, '\t')
+                  .replace(/\\"/g, '"').replace(/\\\\/g, '\\');
               }
               toolBubble.querySelector('pre').textContent = display;
               chatContainer.scrollTop = chatContainer.scrollHeight;
+              // Yield to browser so it can repaint between deltas
+              await new Promise(r => requestAnimationFrame(r));
             }
           } else if (data.type === 'js') {
             loading.style.display = 'none';
@@ -149,13 +154,30 @@ async function sendMessage() {
               toolBubble.querySelector('.tool-header').textContent = 'run_js \u2714';
               toolBubble = null;
             }
-            try { eval(data.code); } catch(err) { console.error('JS eval error:', err); }
+            // Eval and send result back
+            let result = 'OK';
+            try {
+              const val = eval(data.code);
+              if (val !== undefined && val !== null) {
+                result = String(val);
+                if (result.length > 2000) result = result.slice(0, 2000) + '...';
+              }
+            } catch(err) {
+              result = 'Error: ' + err.message;
+              console.error('JS eval error:', err);
+            }
+            if (data.tool_id) {
+              fetch('/tool_result/' + data.tool_id, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({result: result}),
+              });
+            }
           } else if (data.type === 'error') {
             appendMsg('<p><strong>Error:</strong> ' + data.content + '</p>', 'assistant');
           } else if (data.type === 'done') {
             // stream finished
           }
-        }
       }
     }
   } catch (err) {

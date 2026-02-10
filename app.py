@@ -2,6 +2,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import json
+import threading
 from flask import Flask, request, jsonify, render_template, Response
 import anthropic
 
@@ -9,6 +10,10 @@ app = Flask(__name__)
 client = anthropic.Anthropic()
 
 conversation_history = []
+
+# Pending tool results from the browser
+pending_results = {}   # tool_id -> result string
+pending_events = {}    # tool_id -> threading.Event
 
 SYSTEM_PROMPT = """\
 You are a chatbot embedded in a web page. You have two ways to respond:
@@ -28,6 +33,10 @@ to hidden.
 - You can load external libraries by injecting <script> tags into document.head. \
 Wait for onload before using them.
 - You can call run_js multiple times in one turn to build things up incrementally.
+- run_js returns the result of the last expression in your code (like a browser console). \
+Use this to read DOM state, check values, or verify your changes worked. If the code throws, \
+you get the error message back.
+- Do NOT use alert() or prompt() — they block the browser. Use the DOM or console instead.
 - For simple questions, just respond with text. For building/modifying things, use run_js.
 - You have no default theme or styling opinions — you decide everything about look and feel.
 - Be creative and have fun with it.\
@@ -39,8 +48,9 @@ TOOLS = [
         "description": (
             "Execute JavaScript code in the user's browser. Use this to modify the page: "
             "add/remove DOM elements, change styles, inject scripts, create canvases, "
-            "build interactive UIs, etc. The chat interface lives in #chat-container and "
-            "#input-area — you can move, restyle, or resize these but keep chat functional."
+            "build interactive UIs, etc. Returns the result of the last expression "
+            "(or the error message if it threw). The chat interface lives in "
+            "#chat-container and #input-area — keep them visible and functional."
         ),
         "input_schema": {
             "type": "object",
@@ -74,6 +84,16 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/tool_result/<tool_id>", methods=["POST"])
+def receive_tool_result(tool_id):
+    data = request.json
+    pending_results[tool_id] = data.get("result", "OK")
+    ev = pending_events.get(tool_id)
+    if ev:
+        ev.set()
+    return jsonify({"status": "ok"})
+
+
 @app.route("/chat", methods=["POST"])
 def chat():
     user_message = request.json.get("message", "")
@@ -92,6 +112,8 @@ def chat():
                 tool_id = None
                 tool_input_parts = []
                 stop_reason = None
+                # Track tool_ids we need results for this round
+                round_tool_ids = []
 
                 with client.messages.stream(
                     model="claude-opus-4-6",
@@ -123,7 +145,10 @@ def chat():
                                 tool_input = json.loads("".join(tool_input_parts))
                                 code = tool_input.get("code", "")
                                 if code:
-                                    yield sse({"type": "js", "code": code})
+                                    # Register event before sending to browser
+                                    pending_events[tool_id] = threading.Event()
+                                    round_tool_ids.append(tool_id)
+                                    yield sse({"type": "js", "code": code, "tool_id": tool_id})
                             current_block_type = None
 
                         elif event.type == "message_delta":
@@ -140,14 +165,19 @@ def chat():
                 if stop_reason == "end_turn":
                     break
 
-                # Feed tool results back for next round
+                # Wait for browser results and feed them back
                 tool_results = []
                 for block in final_message.content:
                     if block.type == "tool_use" and block.name == "run_js":
+                        ev = pending_events.get(block.id)
+                        if ev:
+                            ev.wait(timeout=30)
+                        result = pending_results.pop(block.id, "OK")
+                        pending_events.pop(block.id, None)
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
-                            "content": "OK",
+                            "content": result,
                         })
 
                 if tool_results:
