@@ -2,13 +2,21 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import json
+import os
 import threading
+import uuid
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify, render_template, Response
 import anthropic
 
 app = Flask(__name__)
 client = anthropic.Anthropic()
 
+CHATS_DIR = os.path.join(os.path.dirname(__file__), "chats")
+os.makedirs(CHATS_DIR, exist_ok=True)
+
+# Current chat state
+current_chat_id = None
 conversation_history = []
 
 # Pending tool results from the browser
@@ -40,7 +48,15 @@ Use this to read DOM state, check values, or verify your changes worked. If the 
 you get the error message back.
 - Do NOT use alert() or prompt() — they block the browser. Use the DOM or console instead.
 - You have no default theme or styling opinions — you decide everything about look and feel.
-- Be creative and have fun with it.\
+- Be creative and have fun with it.
+
+Backend API (use via fetch() in run_js):
+- GET /chats → {"chats": [{"id", "title", "updated_at"}], "current": "id"}
+- POST /chats/<id>/load → {"status": "ok", "id", "messages": [...]} — switches to a saved chat
+- DELETE /chats/<id> → deletes a chat
+- POST /reset → saves current chat, starts a new one
+Chats auto-save after each exchange. Title is derived from the first user message. \
+After loading a chat or resetting, reload the page (location.reload()) to sync the frontend.\
 """
 
 TOOLS = [
@@ -80,6 +96,51 @@ def serialize_block(block):
     return block.model_dump()
 
 
+def chat_path(chat_id):
+    return os.path.join(CHATS_DIR, f"{chat_id}.json")
+
+
+def save_chat():
+    """Save current chat to disk."""
+    if not current_chat_id:
+        return
+    # Derive title from first user message
+    title = "New chat"
+    for msg in conversation_history:
+        if msg["role"] == "user" and isinstance(msg["content"], str):
+            title = msg["content"][:80]
+            break
+    data = {
+        "id": current_chat_id,
+        "title": title,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "messages": conversation_history,
+    }
+    with open(chat_path(current_chat_id), "w") as f:
+        json.dump(data, f)
+
+
+def load_chat(chat_id):
+    """Load a chat from disk. Returns True on success."""
+    global current_chat_id, conversation_history
+    path = chat_path(chat_id)
+    if not os.path.exists(path):
+        return False
+    with open(path) as f:
+        data = json.load(f)
+    current_chat_id = data["id"]
+    conversation_history = data["messages"]
+    return True
+
+
+def new_chat():
+    """Start a fresh chat."""
+    global current_chat_id, conversation_history
+    current_chat_id = uuid.uuid4().hex[:12]
+    conversation_history = []
+    return current_chat_id
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -95,14 +156,56 @@ def receive_tool_result(tool_id):
     return jsonify({"status": "ok"})
 
 
+@app.route("/chats", methods=["GET"])
+def list_chats():
+    chats = []
+    for fname in os.listdir(CHATS_DIR):
+        if not fname.endswith(".json"):
+            continue
+        with open(os.path.join(CHATS_DIR, fname)) as f:
+            data = json.load(f)
+        chats.append({
+            "id": data["id"],
+            "title": data.get("title", "Untitled"),
+            "updated_at": data.get("updated_at", ""),
+        })
+    chats.sort(key=lambda c: c["updated_at"], reverse=True)
+    return jsonify({"chats": chats, "current": current_chat_id})
+
+
+@app.route("/chats/<chat_id>/load", methods=["POST"])
+def load_chat_endpoint(chat_id):
+    # Save current chat first
+    save_chat()
+    if load_chat(chat_id):
+        return jsonify({"status": "ok", "id": current_chat_id, "messages": conversation_history})
+    return jsonify({"status": "error", "message": "Chat not found"}), 404
+
+
+@app.route("/chats/<chat_id>", methods=["DELETE"])
+def delete_chat(chat_id):
+    global current_chat_id, conversation_history
+    path = chat_path(chat_id)
+    if os.path.exists(path):
+        os.remove(path)
+    if current_chat_id == chat_id:
+        new_chat()
+    return jsonify({"status": "ok"})
+
+
 @app.route("/chat", methods=["POST"])
 def chat():
+    global current_chat_id
     user_message = request.json.get("message", "")
     if not user_message:
         return Response(
             sse({"type": "error", "content": "Empty message."}) + sse({"type": "done"}),
             mimetype="text/event-stream",
         )
+
+    # Auto-create a chat if none active
+    if not current_chat_id:
+        new_chat()
 
     conversation_history.append({"role": "user", "content": user_message})
 
@@ -113,7 +216,6 @@ def chat():
                 tool_id = None
                 tool_input_parts = []
                 stop_reason = None
-                # Track tool_ids we need results for this round
                 round_tool_ids = []
 
                 with client.messages.stream(
@@ -146,7 +248,6 @@ def chat():
                                 tool_input = json.loads("".join(tool_input_parts))
                                 code = tool_input.get("code", "")
                                 if code:
-                                    # Register event before sending to browser
                                     pending_events[tool_id] = threading.Event()
                                     round_tool_ids.append(tool_id)
                                     yield sse({"type": "js", "code": code, "tool_id": tool_id})
@@ -157,7 +258,6 @@ def chat():
 
                     final_message = stream.get_final_message()
 
-                # Add assistant turn to history
                 conversation_history.append({
                     "role": "assistant",
                     "content": [serialize_block(b) for b in final_message.content],
@@ -166,7 +266,6 @@ def chat():
                 if stop_reason == "end_turn":
                     break
 
-                # Wait for browser results and feed them back
                 tool_results = []
                 for block in final_message.content:
                     if block.type == "tool_use" and block.name == "run_js":
@@ -189,6 +288,7 @@ def chat():
         except Exception as e:
             yield sse({"type": "error", "content": str(e)})
 
+        save_chat()
         yield sse({"type": "done"})
 
     return Response(generate(), mimetype="text/event-stream", headers={
@@ -199,9 +299,9 @@ def chat():
 
 @app.route("/reset", methods=["POST"])
 def reset():
-    global conversation_history
-    conversation_history = []
-    return jsonify({"status": "ok"})
+    save_chat()
+    chat_id = new_chat()
+    return jsonify({"status": "ok", "id": chat_id})
 
 
 if __name__ == "__main__":
