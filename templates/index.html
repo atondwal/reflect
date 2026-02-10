@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Chatbot</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: sans-serif; height: 100vh; display: flex; flex-direction: column; }
+  #chat-container {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+  }
+  .msg { margin-bottom: 12px; max-width: 80%; padding: 10px 14px; border-radius: 8px; line-height: 1.5; }
+  .msg.user { background: #e3f2fd; margin-left: auto; }
+  .msg.assistant { background: #f5f5f5; }
+  .msg p:last-child { margin-bottom: 0; }
+  #input-area {
+    display: flex;
+    padding: 12px;
+    border-top: 1px solid #ddd;
+    gap: 8px;
+  }
+  #input-area input {
+    flex: 1;
+    padding: 10px;
+    font-size: 16px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    outline: none;
+  }
+  #input-area button {
+    padding: 10px 20px;
+    font-size: 16px;
+    cursor: pointer;
+    border: none;
+    background: #1976d2;
+    color: white;
+    border-radius: 6px;
+  }
+  #input-area button:disabled { opacity: 0.5; cursor: default; }
+  #loading { display: none; padding: 8px 16px; color: #888; font-style: italic; }
+  .tool-bubble { background: #1a1a2e; color: #0f0; border-radius: 8px; margin-bottom: 12px; max-width: 90%; font-family: monospace; font-size: 13px; overflow: hidden; }
+  .tool-bubble .tool-header { background: #16213e; color: #aaa; padding: 6px 12px; font-size: 12px; }
+  .tool-bubble pre { margin: 0; padding: 10px 12px; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto; }
+  .tool-bubble.executed .tool-header { color: #4caf50; }
+</style>
+</head>
+<body>
+
+<div id="chat-container"></div>
+<div id="loading">Claude is thinking...</div>
+<div id="input-area">
+  <input type="text" id="user-input" placeholder="Say something..." autocomplete="off">
+  <button id="send-btn" onclick="sendMessage()">Send</button>
+</div>
+
+<script>
+const chatContainer = document.getElementById('chat-container');
+const userInput = document.getElementById('user-input');
+const sendBtn = document.getElementById('send-btn');
+const loading = document.getElementById('loading');
+
+userInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !sendBtn.disabled) sendMessage();
+});
+
+async function sendMessage() {
+  const text = userInput.value.trim();
+  if (!text) return;
+
+  appendMsg(text, 'user');
+  userInput.value = '';
+  sendBtn.disabled = true;
+  loading.style.display = 'block';
+
+  let currentBubble = null;
+  let currentBubbleText = '';
+  let toolBubble = null;
+  let toolCode = '';
+
+  try {
+    const res = await fetch('/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message: text}),
+    });
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, {stream: true});
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop();
+
+      for (const part of parts) {
+        for (const line of part.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data: ')) continue;
+
+          const data = JSON.parse(trimmed.slice(6));
+
+          if (data.type === 'text_start') {
+            loading.style.display = 'none';
+            currentBubble = document.createElement('div');
+            currentBubble.className = 'msg assistant';
+            chatContainer.appendChild(currentBubble);
+            currentBubbleText = '';
+          } else if (data.type === 'text_delta') {
+            loading.style.display = 'none';
+            if (currentBubble) {
+              currentBubbleText += data.content;
+              currentBubble.innerHTML = currentBubbleText;
+              chatContainer.scrollTop = chatContainer.scrollHeight;
+            }
+          } else if (data.type === 'tool_start') {
+            loading.style.display = 'none';
+            toolCode = '';
+            toolBubble = document.createElement('div');
+            toolBubble.className = 'tool-bubble';
+            toolBubble.innerHTML = '<div class="tool-header">run_js</div><pre></pre>';
+            chatContainer.appendChild(toolBubble);
+          } else if (data.type === 'tool_delta') {
+            toolCode += data.content;
+            if (toolBubble) {
+              // strip JSON wrapper to show just the code
+              let display = toolCode;
+              try {
+                const parsed = JSON.parse(toolCode);
+                display = parsed.code || toolCode;
+              } catch(e) {
+                // partial JSON — strip leading {"code":" and trailing
+                display = toolCode.replace(/^\{"code"\s*:\s*"/, '').replace(/"\}$/, '');
+              }
+              toolBubble.querySelector('pre').textContent = display;
+              chatContainer.scrollTop = chatContainer.scrollHeight;
+            }
+          } else if (data.type === 'js') {
+            loading.style.display = 'none';
+            if (toolBubble) {
+              toolBubble.querySelector('pre').textContent = data.code;
+              toolBubble.classList.add('executed');
+              toolBubble.querySelector('.tool-header').textContent = 'run_js \u2714';
+              toolBubble = null;
+            }
+            try { eval(data.code); } catch(err) { console.error('JS eval error:', err); }
+          } else if (data.type === 'error') {
+            appendMsg('<p><strong>Error:</strong> ' + data.content + '</p>', 'assistant');
+          } else if (data.type === 'done') {
+            // stream finished
+          }
+        }
+      }
+    }
+  } catch (err) {
+    appendMsg('<p>Network error: ' + err.message + '</p>', 'assistant');
+  }
+
+  loading.style.display = 'none';
+  sendBtn.disabled = false;
+  userInput.focus();
+}
+
+function appendMsg(html, role) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.innerHTML = html;
+  chatContainer.appendChild(div);
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+</script>
+</body>
+</html>
