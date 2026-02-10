@@ -25,7 +25,7 @@
   .tool-bubble .tool-header { background: #16213e; color: #888; padding: 3px 8px; font-size: 11px; }
   .tool-bubble pre { margin: 0; padding: 8px; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto; }
   .tool-bubble.executed .tool-header { color: #4caf50; }
-  .tool-bubble .tool-result { border-top: 1px solid #2a2a4a; padding: 4px 8px; font-size: 11px; color: #888; }
+  .tool-bubble .tool-result { border-top: 1px solid #2a2a4a; padding: 4px 8px; font-size: 11px; color: #888; max-height: 200px; overflow-y: auto; white-space: pre-wrap; }
   .tool-bubble .tool-result.error { color: #e57373; }
 </style>
 </head>
@@ -48,6 +48,12 @@ const inputLabel = document.getElementById('input-label');
 let cellN = 1;
 let chatId = null;
 
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
 userInput.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey && !sendBtn.disabled) {
     e.preventDefault();
@@ -59,6 +65,29 @@ userInput.addEventListener('input', () => {
   userInput.style.height = userInput.scrollHeight + 'px';
 });
 
+function renderToolBubble(block, result) {
+  const tb = document.createElement('div');
+  tb.className = 'tool-bubble executed';
+  const name = block.name || 'tool';
+  tb.innerHTML = `<div class="tool-header">${esc(name)} \u2714</div><pre></pre>`;
+  let displayInput;
+  if (name === 'run_js') displayInput = block.input.code;
+  else if (name === 'bash') displayInput = block.input.command;
+  else if (name === 'write_file') displayInput = block.input.content;
+  else if (name === 'edit_file') displayInput = `${block.input.old_string}\n\u2192\n${block.input.new_string}`;
+  else if (name === 'grep') displayInput = `${block.input.pattern} ${block.input.path || '.'}`;
+  else if (block.input.path) displayInput = block.input.path;
+  else displayInput = JSON.stringify(block.input, null, 2);
+  tb.querySelector('pre').textContent = displayInput;
+  if (result !== undefined) {
+    const r = document.createElement('div');
+    r.className = 'tool-result' + (String(result).startsWith('Error') ? ' error' : '');
+    r.textContent = '\u2192 ' + result;
+    tb.appendChild(r);
+  }
+  return tb;
+}
+
 async function loadChat(id) {
   const res = await fetch('/chats/' + id);
   if (!res.ok) return;
@@ -66,29 +95,43 @@ async function loadChat(id) {
   chatId = data.id;
   chatContainer.innerHTML = '';
   cellN = 1;
+
+  // Build map of tool_use_id -> result from tool_result messages
+  const toolResultMap = {};
+  for (const msg of data.messages) {
+    if (msg.role === 'user' && Array.isArray(msg.content)) {
+      for (const item of msg.content) {
+        if (item.type === 'tool_result') {
+          toolResultMap[item.tool_use_id] = item.content;
+        }
+      }
+    }
+  }
+
   for (const msg of data.messages) {
     if (msg.role === 'user' && typeof msg.content === 'string') {
       appendMsg(msg.content, 'user', `In[${cellN}]:=`);
+      cellN++;
     } else if (msg.role === 'assistant' && Array.isArray(msg.content)) {
       for (const block of msg.content) {
         if (block.type === 'text' && block.text.trim()) {
           appendMsg(block.text, 'assistant', `Out[${cellN}]=`);
-        } else if (block.type === 'tool_use' && block.name === 'run_js') {
-          const tb = document.createElement('div');
-          tb.className = 'tool-bubble executed';
-          tb.innerHTML = '<div class="tool-header">run_js \u2714</div><pre></pre>';
-          tb.querySelector('pre').textContent = block.input.code;
+        } else if (block.type === 'tool_use') {
+          const result = toolResultMap[block.id];
+          const tb = renderToolBubble(block, result);
           chatContainer.appendChild(tb);
-          try { eval(block.input.code); } catch(e) {
-            const r = document.createElement('div');
-            r.className = 'tool-result error';
-            r.textContent = '\u2192 Error: ' + e.message;
-            tb.appendChild(r);
+          // Only replay run_js calls
+          if (block.name === 'run_js') {
+            try { eval(block.input.code); } catch(e) {
+              const r = document.createElement('div');
+              r.className = 'tool-result error';
+              r.textContent = '\u2192 Error: ' + e.message;
+              tb.appendChild(r);
+            }
           }
         }
       }
     }
-    if (msg.role === 'user' && typeof msg.content === 'string') cellN++;
   }
   inputLabel.textContent = `In[${cellN}]:=`;
   chatContainer.scrollTop = chatContainer.scrollHeight;
@@ -117,6 +160,7 @@ async function sendMessage() {
   let currentBubbleText = '';
   let toolBubble = null;
   let toolRawJson = '';
+  let currentToolName = '';
 
   try {
     const res = await fetch('/chat', {
@@ -137,7 +181,6 @@ async function sendMessage() {
       const parts = buffer.split('\n\n');
       buffer = parts.pop();
 
-      // Collect all events from this chunk
       const events = [];
       for (const part of parts) {
         for (const line of part.split('\n')) {
@@ -165,17 +208,19 @@ async function sendMessage() {
             }
           } else if (data.type === 'tool_start') {
             loading.style.display = 'none';
+            currentToolName = data.name || 'run_js';
             toolRawJson = '';
             toolBubble = document.createElement('div');
             toolBubble.className = 'tool-bubble';
-            toolBubble.innerHTML = '<div class="tool-header">run_js</div><pre></pre>';
+            toolBubble.innerHTML = `<div class="tool-header">${esc(currentToolName)}</div><pre></pre>`;
             chatContainer.appendChild(toolBubble);
             await new Promise(r => requestAnimationFrame(r));
           } else if (data.type === 'tool_delta') {
             toolRawJson += data.content;
             if (toolBubble) {
               let display = toolRawJson;
-              const match = display.match(/^\s*\{\s*"code"\s*:\s*"([\s\S]*)$/);
+              // Extract first string value from JSON for cleaner display
+              const match = display.match(/^\s*\{\s*"[^"]+"\s*:\s*"([\s\S]*)$/);
               if (match) {
                 display = match[1].replace(/"\s*\}\s*$/, '');
                 display = display.replace(/\\n/g, '\n').replace(/\\t/g, '\t')
@@ -183,7 +228,6 @@ async function sendMessage() {
               }
               toolBubble.querySelector('pre').textContent = display;
               chatContainer.scrollTop = chatContainer.scrollHeight;
-              // Yield to browser so it can repaint between deltas
               await new Promise(r => requestAnimationFrame(r));
             }
           } else if (data.type === 'js') {
@@ -194,7 +238,6 @@ async function sendMessage() {
               toolBubble.querySelector('.tool-header').textContent = 'run_js \u2714';
               toolBubble = null;
             }
-            // Eval and send result back
             let result = 'OK';
             try {
               const val = eval(data.code);
@@ -206,12 +249,11 @@ async function sendMessage() {
               result = 'Error: ' + err.message;
               console.error('JS eval error:', err);
             }
-            // Show result in tool bubble
             const executed = chatContainer.querySelector('.tool-bubble.executed:last-of-type');
             if (executed) {
               const res = document.createElement('div');
               res.className = 'tool-result' + (result.startsWith('Error:') ? ' error' : '');
-              res.textContent = '→ ' + result;
+              res.textContent = '\u2192 ' + result;
               executed.appendChild(res);
               chatContainer.scrollTop = chatContainer.scrollHeight;
             }
@@ -221,6 +263,18 @@ async function sendMessage() {
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({result: result}),
               });
+            }
+          } else if (data.type === 'tool_output') {
+            loading.style.display = 'none';
+            if (toolBubble) {
+              toolBubble.classList.add('executed');
+              toolBubble.querySelector('.tool-header').textContent = (data.name || 'tool') + ' \u2714';
+              const res = document.createElement('div');
+              res.className = 'tool-result' + (data.result && data.result.startsWith('Error') ? ' error' : '');
+              res.textContent = '\u2192 ' + (data.result || 'OK');
+              toolBubble.appendChild(res);
+              toolBubble = null;
+              chatContainer.scrollTop = chatContainer.scrollHeight;
             }
           } else if (data.type === 'error') {
             appendMsg('<p><strong>Error:</strong> ' + data.content + '</p>', 'assistant');
