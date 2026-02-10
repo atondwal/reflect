@@ -25,6 +25,8 @@
   .tool-bubble .tool-header { background: #16213e; color: #888; padding: 3px 8px; font-size: 11px; }
   .tool-bubble pre { margin: 0; padding: 8px; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto; }
   .tool-bubble.executed .tool-header { color: #4caf50; }
+  .tool-bubble .tool-result { border-top: 1px solid #2a2a4a; padding: 4px 8px; font-size: 11px; color: #888; }
+  .tool-bubble .tool-result.error { color: #e57373; }
 </style>
 </head>
 <body>
@@ -44,6 +46,7 @@ const sendBtn = document.getElementById('send-btn');
 const loading = document.getElementById('loading');
 const inputLabel = document.getElementById('input-label');
 let cellN = 1;
+let chatId = null;
 
 userInput.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey && !sendBtn.disabled) {
@@ -55,6 +58,39 @@ userInput.addEventListener('input', () => {
   userInput.style.height = 'auto';
   userInput.style.height = userInput.scrollHeight + 'px';
 });
+
+async function loadChat(id) {
+  const res = await fetch('/chats/' + id);
+  if (!res.ok) return;
+  const data = await res.json();
+  chatId = data.id;
+  chatContainer.innerHTML = '';
+  cellN = 1;
+  for (const msg of data.messages) {
+    if (msg.role === 'user' && typeof msg.content === 'string') {
+      appendMsg(msg.content, 'user', `In[${cellN}]:=`);
+    } else if (msg.role === 'assistant' && Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block.type === 'text' && block.text.trim()) {
+          appendMsg(block.text, 'assistant', `Out[${cellN}]=`);
+        } else if (block.type === 'tool_use' && block.name === 'run_js') {
+          const tb = document.createElement('div');
+          tb.className = 'tool-bubble executed';
+          tb.innerHTML = '<div class="tool-header">run_js \u2714</div><pre></pre>';
+          tb.querySelector('pre').textContent = block.input.code;
+          chatContainer.appendChild(tb);
+        }
+      }
+    }
+    if (msg.role === 'user' && typeof msg.content === 'string') cellN++;
+  }
+  inputLabel.textContent = `In[${cellN}]:=`;
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+// Load chat from URL if present
+const urlChat = new URLSearchParams(location.search).get('chat');
+if (urlChat) loadChat(urlChat);
 
 async function sendMessage() {
   const text = userInput.value.trim();
@@ -74,7 +110,7 @@ async function sendMessage() {
     const res = await fetch('/chat', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({message: text}),
+      body: JSON.stringify({message: text, chat_id: chatId}),
     });
 
     const reader = res.body.getReader();
@@ -158,6 +194,15 @@ async function sendMessage() {
               result = 'Error: ' + err.message;
               console.error('JS eval error:', err);
             }
+            // Show result in tool bubble
+            const executed = chatContainer.querySelector('.tool-bubble.executed:last-of-type');
+            if (executed) {
+              const res = document.createElement('div');
+              res.className = 'tool-result' + (result.startsWith('Error:') ? ' error' : '');
+              res.textContent = '→ ' + result;
+              executed.appendChild(res);
+              chatContainer.scrollTop = chatContainer.scrollHeight;
+            }
             if (data.tool_id) {
               fetch('/tool_result/' + data.tool_id, {
                 method: 'POST',
@@ -168,7 +213,10 @@ async function sendMessage() {
           } else if (data.type === 'error') {
             appendMsg('<p><strong>Error:</strong> ' + data.content + '</p>', 'assistant');
           } else if (data.type === 'done') {
-            // stream finished
+            if (data.chat_id) {
+              chatId = data.chat_id;
+              history.replaceState(null, '', '?chat=' + chatId);
+            }
           }
       }
     }
